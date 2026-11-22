@@ -353,10 +353,6 @@ Deno.serve(async (req: Request) => {
     }
 
     // ─── 8. Call AI via the router: classify → route → fallback ─
-    // Refresh breaker cooldowns first so OPEN circuits become HALF_OPEN
-    // (probeable) once their 60-second cooldown has elapsed.
-    await adminClient.rpc("close_circuit_if_cooldown_elapsed");
-
     // Collect which provider secrets exist so the router only considers
     // providers that are actually configured. Keys themselves stay in env —
     // only their presence is recorded here.

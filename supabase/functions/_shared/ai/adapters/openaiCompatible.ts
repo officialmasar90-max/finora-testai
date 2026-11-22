@@ -112,23 +112,5 @@ export function createOpenAICompatibleAdapter(cfg: OpenAICompatibleConfig): Prov
         latencyMs,
       };
     },
-
-    async probe(apiKey: string) {
-      const startedAt = Date.now();
-      try {
-        const response = await fetch(`${cfg.baseUrl}/models`, {
-          headers: { Authorization: `Bearer ${apiKey}` },
-          signal: AbortSignal.timeout(10_000),
-        });
-        return {
-          ok: response.ok,
-          latencyMs: Date.now() - startedAt,
-          httpStatus: response.status,
-          ...(response.ok ? {} : { errorCode: response.status === 429 ? "rate_limit" : undefined }),
-        };
-      } catch {
-        return { ok: false, latencyMs: Date.now() - startedAt, httpStatus: 0, errorCode: "timeout" };
-      }
-    },
   };
 }
