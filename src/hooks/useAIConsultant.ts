@@ -113,11 +113,18 @@ export function useAIConsultant() {
 
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({}));
-        const msg =
+        let msg: string =
+          errorBody?.message ??
           errorBody?.error ??
-          (response.status === 429
-            ? 'Batas harian tercapai. Coba lagi besok.'
-            : `Permintaan gagal (${response.status})`);
+          `Permintaan gagal (${response.status})`;
+        // The error field may be a machine-readable code (e.g. DAILY_LIMIT_REACHED)
+        if (errorBody?.error && !errorBody?.message) {
+          if (errorBody.error === 'DAILY_LIMIT_REACHED') {
+            msg = 'Batas penggunaan AI harian Anda telah tercapai. Coba lagi besok.';
+          } else if (errorBody.error === 'BURST_LIMIT_REACHED') {
+            msg = 'Terlalu banyak permintaan dalam waktu singkat. Tunggu sebentar lalu coba lagi.';
+          }
+        }
         setError(msg);
         // Remove the optimistic message on error
         setMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id));

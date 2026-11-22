@@ -12,6 +12,13 @@
 // If no provider secret is configured, or every provider fails, the function
 // returns a 502 with aiUnavailable so the frontend can inform the user — it
 // never pretends to work.
+//
+// Rate limiting is atomic and enforced in the database: consume_ai_usage()
+// reserves one message (daily quota + 60s burst window) in a single locked
+// statement. The RPC runs AFTER the caller's JWT is verified and BEFORE any
+// AI provider is contacted — a rejected request never costs provider credit.
+// If the rate limiter itself fails, the function fails closed: the request is
+// NOT forwarded to any provider.
 
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import { AiProviderError } from "../_shared/ai/errors.ts";
@@ -25,7 +32,99 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+// Daily quota — unchanged from the previous configuration.
 const MAX_DAILY_MESSAGES = 30;
+// Burst limit: max requests per rolling 60-second window per user.
+const BURST_LIMIT_PER_MINUTE = 5;
+
+interface ConsumeAiUsageResult {
+  allowed: boolean;
+  reason: string | null;
+  daily_used: number;
+  daily_remaining: number;
+  retry_after_seconds: number;
+}
+
+function json(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+/** Rate-limit rejection: 429 with a machine-readable code. */
+function rateLimited(
+  error: "DAILY_LIMIT_REACHED" | "BURST_LIMIT_REACHED",
+  message: string,
+  remaining: number,
+  retryAfterSeconds: number
+): Response {
+  const headers = {
+    ...corsHeaders,
+    "Content-Type": "application/json",
+    "Retry-After": String(Math.max(1, retryAfterSeconds)),
+  };
+  return new Response(
+    JSON.stringify({ error, message, remaining, retryAfterSeconds }),
+    { status: 429, headers }
+  );
+}
+
+/** Reserve one AI message via the atomic database rate limiter.
+ *  Returns a rejection Response, or null when the reservation succeeded. */
+async function consumeAiUsage(
+  adminClient: ReturnType<typeof createClient>,
+  userId: string
+): Promise<Response | null> {
+  const { data, error } = await adminClient.rpc("consume_ai_usage", {
+    p_user_id: userId,
+    p_daily_limit: MAX_DAILY_MESSAGES,
+    p_burst_limit: BURST_LIMIT_PER_MINUTE,
+  });
+
+  if (error) {
+    // Fail closed: a limiter failure must never let a request through.
+    console.error("Rate limiter RPC failed (fail-closed):", error.message);
+    return json(
+      { error: "Terjadi kesalahan sistem. Silakan coba lagi." },
+      500
+    );
+  }
+
+  const result = Array.isArray(data) ? data[0] as ConsumeAiUsageResult | undefined : undefined;
+  if (!result || typeof result.allowed !== "boolean") {
+    console.error("Rate limiter RPC returned unexpected shape (fail-closed)");
+    return json(
+      { error: "Terjadi kesalahan sistem. Silakan coba lagi." },
+      500
+    );
+  }
+
+  if (!result.allowed) {
+    console.warn(
+      `Rate limit: user=${userId} status=${result.reason} used=${result.daily_used} remaining=${result.daily_remaining}`
+    );
+    if (result.reason === "BURST_LIMIT_REACHED") {
+      return rateLimited(
+        "BURST_LIMIT_REACHED",
+        "Terlalu banyak permintaan dalam waktu singkat. Tunggu sebentar lalu coba lagi.",
+        result.daily_remaining ?? 0,
+        result.retry_after_seconds ?? 60
+      );
+    }
+    return rateLimited(
+      "DAILY_LIMIT_REACHED",
+      "Batas penggunaan AI harian Anda telah tercapai. Coba lagi besok.",
+      0,
+      result.retry_after_seconds ?? 0
+    );
+  }
+
+  console.log(
+    `Rate limit OK: user=${userId} used=${result.daily_used} remaining=${result.daily_remaining}`
+  );
+  return null;
+}
 const SYSTEM_PROMPT = `Anda adalah Konsultan Keuangan AI Finora — asisten keuangan pribadi yang membantu pengguna berbahasa Indonesia.
 
 PRINSIP KERJA:
@@ -64,13 +163,8 @@ const MAX_MESSAGE_LENGTH = 5_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function badRequest(error: string, status = 400): Response {
-  return new Response(JSON.stringify({ error }), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+  return json({ error }, status);
 }
-
-/** Validate the parsed request body. Returns an error response or null. */
 function validateChatRequest(body: unknown): { body: ChatRequest; error: Response } | {
   body: ChatRequest;
   error: null;
@@ -155,22 +249,11 @@ Deno.serve(async (req: Request) => {
     // Service role client for DB operations (bypasses RLS)
     const adminClient = createClient(supabaseUrl, serviceRoleKey);
 
-    // ─── 2. Rate limiting: count messages today ────────────────
-    const today = new Date().toISOString().split("T")[0];
-    const { count: todayCount } = await adminClient
-      .from("ai_messages")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", user.id)
-      .gte("created_at", `${today}T00:00:00Z`);
-
-    if ((todayCount ?? 0) >= MAX_DAILY_MESSAGES) {
-      return new Response(
-        JSON.stringify({
-          error: `Batas harian tercapai. Anda telah mengirim ${MAX_DAILY_MESSAGES} pesan hari ini. Coba lagi besok.`,
-        }),
-        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
+    // ─── 2. Atomic rate limit: reserve one message BEFORE anything else ──
+    // Verifies daily quota (30/day, UTC) + burst limit (5/min) in one locked
+    // database statement. Rejected requests never reach any AI provider.
+    const rateLimitResponse = await consumeAiUsage(adminClient, user.id);
+    if (rateLimitResponse) return rateLimitResponse;
 
     // ─── 3. Parse and validate request body ────────────────────
     let rawBody: unknown;
@@ -297,6 +380,9 @@ Deno.serve(async (req: Request) => {
     }
 
     const reply = aiResult.text;
+    console.log(
+      `AI request OK: user=${user.id} provider=${aiResult.providerId} model=${aiResult.model} latencyMs=${aiResult.latencyMs} fallback=${aiResult.fallbackTrail.length}`
+    );
 
     // ─── 9. Save assistant message ─────────────────────────────
     const { error: assistantMsgError } = await adminClient
