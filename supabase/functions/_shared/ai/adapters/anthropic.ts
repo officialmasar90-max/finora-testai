@@ -125,4 +125,24 @@ export const anthropicAdapter: ProviderAdapter = {
       latencyMs,
     };
   },
+
+  async probe(apiKey: string) {
+    const startedAt = Date.now();
+    try {
+      // Anthropic has no free models listing; a HEAD/GET to the API root
+      // validates reachability and auth without generating tokens.
+      const response = await fetch(`${ANTHROPIC_BASE_URL}/models`, {
+        headers: { "x-api-key": apiKey, "anthropic-version": API_VERSION },
+        signal: AbortSignal.timeout(10_000),
+      });
+      return {
+        ok: response.ok,
+        latencyMs: Date.now() - startedAt,
+        httpStatus: response.status,
+        ...(response.ok ? {} : { errorCode: response.status === 429 ? "rate_limit" : undefined }),
+      };
+    } catch {
+      return { ok: false, latencyMs: Date.now() - startedAt, httpStatus: 0, errorCode: "timeout" };
+    }
+  },
 };

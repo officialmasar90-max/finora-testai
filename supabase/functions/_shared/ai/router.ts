@@ -16,7 +16,8 @@
 // quota) skip the provider entirely. Never retries past MAX_TOTAL_ATTEMPTS,
 // never leaks keys or raw provider errors.
 
-import { getRegisteredProviderIds, hasProviderSecret, chatViaProvider } from "./providerRegistry.ts";
+import { getRegisteredProviderIds, hasProviderSecret } from "./providerRegistry.ts";
+import { canProviderServe, chatViaProviderWithMonitoring } from "./health.ts";
 import { AiProviderError } from "./errors.ts";
 import { DEFAULT_TASK, MODEL_REGISTRY } from "./modelRegistry.ts";
 import type { AiTaskType, ModelEntry } from "./modelRegistry.ts";
@@ -88,6 +89,10 @@ export function classifyQuestion(message: string): AiTaskType {
  * Ordered candidates for a task: configured, registered, active providers
  * only, highest priority first. Never throws — an empty list means the
  * caller reports the AI as unavailable.
+ *
+ * This list is the STATIC candidate list (registry order). Runtime health
+ * filtering happens per attempt in executeWithFallback, so a provider whose
+ * circuit opens mid-request is skipped without re-sorting anything.
  */
 export function routeForTask(
   task: AiTaskType,
@@ -118,6 +123,11 @@ function toAiRequest(candidate: RouteDecision, base: Omit<AiChatRequest, "provid
 /**
  * Execute the chat request across the routed candidates with bounded
  * fallback. Throws the last AiProviderError if every attempt fails.
+ *
+ * Circuit breaker integration: candidates whose circuit is OPEN are skipped
+ * before any network call; a HALF_OPEN candidate accepts a single probe
+ * attempt. Provider attempts are passively monitored (outcome + latency +
+ * error class recorded server-side).
  */
 export async function executeWithFallback(
   candidates: RouteDecision[],
@@ -130,12 +140,24 @@ export async function executeWithFallback(
   for (const candidate of candidates) {
     if (attempts >= MAX_TOTAL_ATTEMPTS) break;
 
+    // Circuit breaker gate: skip before contacting the provider.
+    const mayServe = await canProviderServe(candidate.providerId);
+    if (!mayServe) {
+      console.warn(
+        `AI router: ${candidate.providerId} circuit is OPEN — skipped without a network call.`
+      );
+      continue;
+    }
+
     // One same-provider retry for transient errors, then move on.
     let lastError: AiProviderError | null = null;
     for (let inner = 0; inner < 2 && attempts < MAX_TOTAL_ATTEMPTS; inner++) {
       attempts++;
       try {
-        const result = await chatViaProvider(toAiRequest(candidate, base));
+        const { response: result } = await chatViaProviderWithMonitoring(
+          toAiRequest(candidate, base),
+          candidate.displayName
+        );
         return { ...result, fallbackTrail };
       } catch (err) {
         const providerError =

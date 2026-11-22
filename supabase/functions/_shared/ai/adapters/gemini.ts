@@ -140,4 +140,22 @@ export const geminiAdapter: ProviderAdapter = {
       latencyMs,
     };
   },
+
+  async probe(apiKey: string) {
+    const startedAt = Date.now();
+    try {
+      const response = await fetch(`${GEMINI_BASE_URL}/models`, {
+        headers: { "x-goog-api-key": apiKey },
+        signal: AbortSignal.timeout(10_000),
+      });
+      return {
+        ok: response.ok,
+        latencyMs: Date.now() - startedAt,
+        httpStatus: response.status,
+        ...(response.ok ? {} : { errorCode: response.status === 429 ? "rate_limit" : undefined }),
+      };
+    } catch {
+      return { ok: false, latencyMs: Date.now() - startedAt, httpStatus: 0, errorCode: "timeout" };
+    }
+  },
 };

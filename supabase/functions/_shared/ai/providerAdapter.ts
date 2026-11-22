@@ -21,4 +21,16 @@ export interface ProviderAdapter {
 
   /** Execute a chat completion. Throws AiProviderError on any failure. */
   chat(request: AiChatRequest, apiKey: string): Promise<AiChatResponse>;
+
+  /**
+   * Cheap, free health probe using the provider's official model-listing
+   * endpoint (no token generation, no billing impact). Never throws —
+   * returns an outcome suitable for passive monitoring.
+   */
+  probe(apiKey: string): Promise<{
+    ok: boolean;
+    latencyMs: number;
+    httpStatus: number;
+    errorCode?: string;
+  }>;
 }

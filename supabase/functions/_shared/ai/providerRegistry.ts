@@ -47,6 +47,16 @@ export function hasProviderSecret(providerId: string): boolean {
   return typeof key === "string" && key.length > 0;
 }
 
+/** The provider's free health probe, if the provider is registered. */
+export function getAdapterProbe(providerId: string): ProviderAdapter | null {
+  return ADAPTERS[providerId] ?? null;
+}
+
+/** The provider's free health probe, if the provider is registered. */
+export function getAdapterProbe(providerId: string): ProviderAdapter | null {
+  return ADAPTERS[providerId] ?? null;
+}
+
 /**
  * Execute a chat completion via the registered provider.
  * Throws AiProviderError when the provider is unknown or the call fails.

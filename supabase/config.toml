@@ -1,3 +1,7 @@
 [functions.ai-consultant]
 verify_jwt = true
 entrypoint = "./functions/ai-consultant/index.ts"
+
+[functions.ai-health-check]
+verify_jwt = false
+entrypoint = "./functions/ai-health-check/index.ts"
